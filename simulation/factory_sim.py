@@ -190,3 +190,61 @@ class Station:
 
 
 # ----- Simulation Process -----
+
+def part_process(env, part_id, stations, production_log, quality_log):
+    """ Simulate a single part moving through all stations """
+    status = "good"
+
+    for station in stations:
+        # Request a machine at the station
+        with station.machine.request() as request:
+            queue_enter = env.now
+            yield request # Wait for machine availability
+            queue_wait = env.now - queue_enter
+
+            # If station is broken, wait until it's repaired
+            downtime_wait_start = env.now
+            while station.broken:
+                yield env.timeout(1)  # Wait 1 minute and check again
+            downtime_wait = env.now - downtime_wait_start
+
+            # Process the part
+            shift = get_shift(env.now)
+            operator = get_operator(shift) if station.config["is_manual"] else None
+            cycle_time = station.get_cycle_time(shift)
+            process_start = env.now
+            yield env.timeout(cycle_time)
+            process_end = env.now
+
+            # Check quality
+            defect = station.check_quality(shift)
+            if defect:
+                status = "scrapped"
+                quality_log.append({
+                    "part_id": f"P-{part_id:06d}",
+                    "station": station.name,
+                    "defect_type": defect,
+                    "defect_time_min": env.now,
+                    "shift": shift,
+                    "operator": operator
+                })
+
+            # Log production event
+            production_log.append({
+                "part_id": f"P-{part_id:06d}",
+                "station": station.name,
+                "shift": shift,
+                "operator": operator,
+                "queue_wait_min": round(queue_wait, 2),
+                "downtime_wait_min": round(downtime_wait, 2),
+                "cycle_time_min": round(cycle_time, 2),
+                "start_min": round(process_start, 2),
+                "end_min": round(process_end, 2),
+                "status": status
+            })
+
+        if status == "scrapped":
+            return  # Stop processing this part if scrapped
+    return # Part completed all stations successfully
+
+
