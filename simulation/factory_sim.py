@@ -31,8 +31,21 @@ SIM_DAYS = 90
 SIM_START = datetime(2024, 1, 1, 6, 0, 0)  # Monday 6 AM
 
 # Parts arrive to the line on average every ARRIVAL_INTERVAL minutes.
-# Set slightly faster than bottleneck to build realistic WIP.
-ARRIVAL_INTERVAL_MEAN = 2.0
+# The line's constraint is Inspection at 3.5 min/part. Setting arrival
+# at 3.3 min (~106 % of constraint capacity) models the post-Meridian
+# demand surge that exceeds what the line can sustain.
+ARRIVAL_INTERVAL_MEAN = 3.3
+
+# WIP buffer capacities between adjacent stations (number of parts).
+# Models physical floor space / pallet positions between stations.
+# When a downstream buffer is full, the upstream machine blocks
+# (cannot release its finished part), throttling the line naturally.
+BUFFER_CAPACITIES = [30, 25, 20, 15]  # S1→S2, S2→S3, S3→S4, S4→S5
+
+# Raw-material staging area before S1.  Limits how many incoming parts
+# can queue at the head of the line.  When full, new arrivals wait
+# (modelling deferred material deliveries / full staging racks).
+RAW_MATERIAL_STAGING = 40
 
 # Shift schedule and performance multipliers.
 # Manual stations are slower on swing/night shifts (fatigue, staffing).
@@ -70,7 +83,8 @@ STATIONS = [
         "scrap_rate": 0.03,
         "is_manual": False,
         "defect_types": ["dimensional_error", "surface_finish", "tool_wear_mark"],
-        "breakdown_causes": ["tool_breakage", "spindle_failure", "coolant_system", "servo_error"],
+        "breakdown_causes": ["tool_breakage", "spindle_failure",
+                             "coolant_system", "servo_error"],
     },
     {
         "name": "S2_Welding",
@@ -81,7 +95,8 @@ STATIONS = [
         "scrap_rate": 0.02,
         "is_manual": False,
         "defect_types": ["weak_weld", "porosity", "spatter_damage"],
-        "breakdown_causes": ["electrode_wear", "gas_flow_issue", "power_supply_fault", "wire_feed_jam"],
+        "breakdown_causes": ["electrode_wear", "gas_flow_issue",
+                             "power_supply_fault", "wire_feed_jam"],
     },
     {
         "name": "S3_Assembly",
@@ -91,8 +106,10 @@ STATIONS = [
         "mttr": (15, 5),
         "scrap_rate": 0.04,
         "is_manual": True,
-        "defect_types": ["misalignment", "missing_fastener", "incorrect_torque", "cosmetic_scratch"],
-        "breakdown_causes": ["pneumatic_tool_failure", "fixture_jam", "sensor_misread"],
+        "defect_types": ["misalignment", "missing_fastener",
+                         "incorrect_torque", "cosmetic_scratch"],
+        "breakdown_causes": ["pneumatic_tool_failure", "fixture_jam",
+                             "sensor_misread"],
     },
     {
         "name": "S4_Inspection",
@@ -103,7 +120,8 @@ STATIONS = [
         "scrap_rate": 0.0,   # Inspection detects defects; doesn't create them
         "is_manual": True,
         "defect_types": [],
-        "breakdown_causes": ["calibration_drift", "camera_failure", "software_crash"],
+        "breakdown_causes": ["calibration_drift", "camera_failure",
+                             "software_crash"],
     },
     {
         "name": "S5_Packaging",
@@ -114,7 +132,8 @@ STATIONS = [
         "scrap_rate": 0.01,
         "is_manual": True,
         "defect_types": ["label_error", "packaging_damage"],
-        "breakdown_causes": ["conveyor_jam", "label_printer_fault", "seal_bar_failure"],
+        "breakdown_causes": ["conveyor_jam", "label_printer_fault",
+                             "seal_bar_failure"],
     },
 ]
 
@@ -218,11 +237,27 @@ class Station:
 # SIMULATION PROCESSES
 # ═══════════════════════════════════════════════════════════════
 
-def part_flow(env, part_id, stations, production_log, quality_log):
-    """Move one part sequentially through every station."""
+def part_flow(env, part_id, stations, buffers, raw_staging,
+              production_log, quality_log):
+    """Move one part sequentially through every station.
+
+    Buffer logic (blocking model):
+      After processing at station i, the part tries to enter the
+      downstream buffer (buffers[i]).  If that buffer is full the part
+      stays on the machine — blocking it from starting the next part —
+      until a slot opens.  When the part finishes at station i+1 it
+      returns the slot to buffers[i], freeing space for upstream.
+
+      Station 0 (CNC) also frees a raw-material staging slot when its
+      part moves on, allowing a new arrival to enter the line.
+
+    Buffers are SimPy Containers initialised to their capacity.
+      get(1) = consume a slot  (part enters the inter-station WIP area)
+      put(1) = release a slot  (part leaves that WIP area)
+    """
     status = "good"
 
-    for station in stations:
+    for i, station in enumerate(stations):
         # Request a machine at this station
         with station.machine.request() as req:
             queue_enter = env.now
@@ -256,21 +291,38 @@ def part_flow(env, part_id, stations, production_log, quality_log):
                     "operator": operator,
                 })
 
-            # Log production event
-            production_log.append({
-                "part_id": f"P-{part_id:06d}",
-                "station": station.name,
-                "shift": shift,
-                "operator": operator,
-                "queue_wait_min": round(queue_wait, 2),
-                "downtime_wait_min": round(downtime_wait, 2),
-                "cycle_time_min": round(cycle_time, 2),
-                "start_min": round(proc_start, 2),
-                "end_min": round(proc_end, 2),
-                "status": status,
-            })
+            # ── Blocking: wait for downstream buffer space ────────
+            blocking_time = 0.0
+            if i < len(buffers) and status == "good":
+                block_start = env.now
+                yield buffers[i].get(1)
+                blocking_time = env.now - block_start
 
-        # If scrapped, part exits the line
+        # ── Machine released (with-block exited) ─────────────────
+
+        # Free upstream buffer slot (part has moved on from that area)
+        if i > 0:
+            yield buffers[i - 1].put(1)
+        elif i == 0:
+            # Part leaves the raw-material staging area
+            yield raw_staging.put(1)
+
+        # Log production event
+        production_log.append({
+            "part_id": f"P-{part_id:06d}",
+            "station": station.name,
+            "shift": shift,
+            "operator": operator,
+            "queue_wait_min": round(queue_wait, 2),
+            "downtime_wait_min": round(downtime_wait, 2),
+            "cycle_time_min": round(cycle_time, 2),
+            "blocking_time_min": round(blocking_time, 2),
+            "start_min": round(proc_start, 2),
+            "end_min": round(proc_end, 2),
+            "status": status,
+        })
+
+        # If scrapped, free upstream buffer and exit
         if status == "scrapped":
             return
 
@@ -278,12 +330,20 @@ def part_flow(env, part_id, stations, production_log, quality_log):
     return
 
 
-def part_generator(env, stations, production_log, quality_log):
+def part_generator(env, stations, buffers, raw_staging,
+                   production_log, quality_log):
     """Generate new parts arriving at the line."""
     part_id = 0
     while True:
         part_id += 1
-        env.process(part_flow(env, part_id, stations, production_log, quality_log))
+
+        # Wait for a raw-material staging slot before entering the line
+        yield raw_staging.get(1)
+
+        env.process(
+            part_flow(env, part_id, stations, buffers, raw_staging,
+                      production_log, quality_log)
+        )
 
         # Exponential inter-arrival (models variable raw-material feed)
         interval = random.expovariate(1.0 / ARRIVAL_INTERVAL_MEAN)
@@ -317,7 +377,9 @@ def inject_noise(df: pd.DataFrame) -> pd.DataFrame:
     time_cols = [c for c in df.columns if c.endswith("_min")]
     for col in time_cols:
         valid = df[col].notna()
-        jitter = rng.uniform(-TIMESTAMP_JITTER_SEC / 60, TIMESTAMP_JITTER_SEC / 60, size=valid.sum())
+        jitter = rng.uniform(
+            -TIMESTAMP_JITTER_SEC / 60, TIMESTAMP_JITTER_SEC / 60, size=valid.sum()
+        )
         df.loc[valid, col] = df.loc[valid, col] + jitter
 
     # 4. Shuffle to destroy perfect ordering (like a real data dump)
@@ -334,10 +396,15 @@ def add_datetime_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
     # Only convert absolute-time columns, not durations
-    absolute_time_cols = [c for c in df.columns if c.endswith("_min") and any(k in c for k in ("start", "end", "detection"))]
+    absolute_time_cols = [c for c in df.columns
+                          if c.endswith("_min")
+                          and any(k in c for k in ("start", "end", "detection"))]
     for col in absolute_time_cols:
         dt_col = col.replace("_min", "_timestamp")
-        df[dt_col] = df[col].apply(lambda x: sim_minutes_to_datetime(x).strftime("%Y-%m-%d %H:%M:%S") if pd.notna(x) else None)
+        df[dt_col] = df[col].apply(
+            lambda x: sim_minutes_to_datetime(x).strftime("%Y-%m-%d %H:%M:%S")
+            if pd.notna(x) else None
+        )
     return df
 
 
@@ -390,8 +457,23 @@ def run_simulation(sim_days=SIM_DAYS, seed=RANDOM_SEED, output_dir="data"):
     # Create stations
     stations = [Station(env, cfg, downtime_log) for cfg in STATIONS]
 
+    # Create inter-station WIP buffers (Container initialised to capacity =
+    # all slots free).  get(1) consumes a slot; put(1) releases one.
+    buffers = [
+        simpy.Container(env, capacity=cap, init=cap)
+        for cap in BUFFER_CAPACITIES
+    ]
+
+    # Raw-material staging area before the first station
+    raw_staging = simpy.Container(
+        env, capacity=RAW_MATERIAL_STAGING, init=RAW_MATERIAL_STAGING
+    )
+
     # Start generating parts
-    env.process(part_generator(env, stations, production_log, quality_log))
+    env.process(
+        part_generator(env, stations, buffers, raw_staging,
+                       production_log, quality_log)
+    )
 
     # Run
     print(f"Running simulation: {sim_days} days, seed={seed}")
@@ -400,9 +482,12 @@ def run_simulation(sim_days=SIM_DAYS, seed=RANDOM_SEED, output_dir="data"):
 
     # ── Summary stats (computed from CLEAN logs, before noise) ──
     part_ids_all = {r["part_id"] for r in production_log}
-    part_ids_completed = {r["part_id"] for r in production_log if r["station"] == "S5_Packaging" and r["status"] == "good"}
-    part_ids_scrapped = {r["part_id"] for r in production_log if r["status"] == "scrapped"}
-    total_downtime_hrs = (sum(r["duration_min"] for r in downtime_log) / 60 if downtime_log else 0)
+    part_ids_completed = {r["part_id"] for r in production_log
+                          if r["station"] == "S5_Packaging" and r["status"] == "good"}
+    part_ids_scrapped = {r["part_id"] for r in production_log
+                         if r["status"] == "scrapped"}
+    total_downtime_hrs = (sum(r["duration_min"] for r in downtime_log) / 60
+                          if downtime_log else 0)
 
     total_parts = len(part_ids_all)
     completed = len(part_ids_completed)
@@ -424,7 +509,9 @@ def run_simulation(sim_days=SIM_DAYS, seed=RANDOM_SEED, output_dir="data"):
 
     # ── Export data (noise injected into CSVs only) ───────────
     print(f"\nExporting data to '{output_dir}/'...")
-    df_prod, df_down, df_qual = export_data(production_log, downtime_log, quality_log, output_dir)
+    df_prod, df_down, df_qual = export_data(
+        production_log, downtime_log, quality_log, output_dir
+    )
 
     print(f"\n  Files written:")
     print(f"    {output_dir}/production_log.csv   ({len(df_prod):,} rows)")
@@ -436,11 +523,12 @@ def run_simulation(sim_days=SIM_DAYS, seed=RANDOM_SEED, output_dir="data"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Factory Line Simulation")
-    parser.add_argument("--days", type=int, default=SIM_DAYS, help="Number of days to simulate")
-    parser.add_argument("--seed", type=int, default=RANDOM_SEED, help="Random seed for reproducibility")
-    parser.add_argument("--output", type=str, default="data", help="Output directory for CSV files")
+    parser.add_argument("--days", type=int, default=SIM_DAYS,
+                        help="Number of days to simulate")
+    parser.add_argument("--seed", type=int, default=RANDOM_SEED,
+                        help="Random seed for reproducibility")
+    parser.add_argument("--output", type=str, default="data",
+                        help="Output directory for CSV files")
     args = parser.parse_args()
 
     run_simulation(sim_days=args.days, seed=args.seed, output_dir=args.output)
-
-    
