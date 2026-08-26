@@ -509,9 +509,7 @@ def run_simulation(sim_days=SIM_DAYS, seed=RANDOM_SEED, output_dir="data"):
 
     # ── Export data (noise injected into CSVs only) ───────────
     print(f"\nExporting data to '{output_dir}/'...")
-    df_prod, df_down, df_qual = export_data(
-        production_log, downtime_log, quality_log, output_dir
-    )
+    df_prod, df_down, df_qual = export_data(production_log, downtime_log, quality_log, output_dir)
 
     print(f"\n  Files written:")
     print(f"    {output_dir}/production_log.csv   ({len(df_prod):,} rows)")
