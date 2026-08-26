@@ -523,12 +523,9 @@ def run_simulation(sim_days=SIM_DAYS, seed=RANDOM_SEED, output_dir="data"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Factory Line Simulation")
-    parser.add_argument("--days", type=int, default=SIM_DAYS,
-                        help="Number of days to simulate")
-    parser.add_argument("--seed", type=int, default=RANDOM_SEED,
-                        help="Random seed for reproducibility")
-    parser.add_argument("--output", type=str, default="data",
-                        help="Output directory for CSV files")
+    parser.add_argument("--days", type=int, default=SIM_DAYS, help="Number of days to simulate")
+    parser.add_argument("--seed", type=int, default=RANDOM_SEED, help="Random seed for reproducibility")
+    parser.add_argument("--output", type=str, default="data", help="Output directory for CSV files")
     args = parser.parse_args()
 
     run_simulation(sim_days=args.days, seed=args.seed, output_dir=args.output)
